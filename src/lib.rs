@@ -1,4 +1,3 @@
-use std::result;
 // Based on: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -375,6 +374,79 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
     // Promise.any
+    pub fn any(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<T, Vec<E>>
+    where
+        T: 'static,
+        E: 'static,
+    {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        Promise::new(move |resolve, reject| {
+            let resolve = Arc::new(Mutex::new(Some(resolve)));
+            let reject = Arc::new(Mutex::new(Some(reject)));
+            let is_fullfilled = Arc::new(AtomicBool::new(false));
+            let mut is_pending = false;
+
+            let promises: Vec<_> = promises.into_iter().collect();
+            let n_promises = promises.len();
+
+            for promise in promises {
+                let errors = errors.clone();
+
+                let resolve = resolve.clone();
+                let reject = reject.clone();
+
+                let is_fullfilled_1 = is_fullfilled.clone();
+                let is_fulfilled_2 = is_fullfilled.clone();
+
+                {
+                    let guard = promise.promise.clone();
+                    let mut inner = guard.lock().unwrap();
+                    if let State::Pending = inner.state {
+                        is_pending = true;
+                        // Overwrite callback
+                        inner.callback_fullfilled.replace(Box::new(move |value| {
+                            if is_fullfilled_1.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+
+                            let resolve = resolve.lock().unwrap().take().unwrap();
+                            is_fullfilled_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                            resolve(value);
+                        }));
+                        inner.callback_rejected.replace(Box::new(move |error| {
+                            if is_fulfilled_2.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+
+                            errors.lock().unwrap().push(error);
+                            // Check if all promises rejected
+                            if errors.lock().unwrap().len() == n_promises {
+                                let reject = reject.lock().unwrap().take().unwrap();
+
+                                reject(get_inner(errors));
+                            }
+                        }));
+                        continue;
+                    }
+                }
+
+                match get_inner(promise.promise).state {
+                    State::Pending => unreachable!("Pending state is handled before"),
+                    State::Fulfilled(value) => {
+                        let resolve = resolve.lock().unwrap().take().unwrap();
+                        is_fullfilled_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                        resolve(value);
+                    }
+                    State::Rejected(error) => errors.lock().unwrap().push(error),
+                }
+            }
+            // No async promises, can resolve immediately
+            if is_pending == false {
+                let reject = reject.lock().unwrap().take().unwrap();
+                reject(get_inner(errors));
+            }
+        })
+    }
     // Promise.resolve
     // Promise.reject
     // Promise.race
@@ -415,7 +487,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(true);
             });
         });
@@ -458,7 +530,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(42);
             });
         });
@@ -493,7 +565,7 @@ mod tests {
             // reject after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 reject("error");
             });
         });
@@ -540,7 +612,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(42);
             });
         });
@@ -563,7 +635,7 @@ mod tests {
             // reject after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 reject(42);
             });
         });
@@ -641,7 +713,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
             });
         });
@@ -671,7 +743,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
             });
         });
@@ -682,6 +754,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     pub fn allSettled() {
         let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
             resolve(42);
@@ -705,6 +778,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     pub fn allSettled_reject() {
         let promise1: Promise<i32, i32> = Promise::new(|resolve, _reject| {
             resolve(42);
@@ -726,6 +800,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+
     pub fn allSettled_on_timeout() {
         use std::thread;
         let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
@@ -745,7 +821,7 @@ mod tests {
             // resolve after 1 second
             // create a new thread
             thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
             });
         });
@@ -760,5 +836,61 @@ mod tests {
                 State::Fulfilled(3)
             ])
         );
+    }
+
+    #[test]
+    pub fn any() {
+        let promise1: Promise<i32, i32> = Promise::new(|_resolve, _reject| {});
+        let promise2: Promise<i32, i32> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(0);
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::any(promises);
+        assert_eq!(promise.state(), State::Fulfilled(42));
+    }
+
+    #[test]
+    pub fn any_reject() {
+        let promise1: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(42);
+        });
+        let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(42);
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(42);
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::any(promises);
+        assert_eq!(promise.state(), State::Rejected(vec![42, 42, 42]));
+    }
+
+    #[test]
+    pub fn any_on_timeout() {
+        use std::thread;
+        let promise1: Promise<i32, i32> = Promise::new(|_resolve, _reject| {});
+        let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            // resolve after 1 second
+            // create a new thread
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(10));
+                reject(0);
+            });
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|resolve, _reject| {
+            // resolve after 1 second
+            // create a new thread
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(20));
+                resolve(42);
+            });
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::any(promises);
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(promise.state(), State::Fulfilled(42));
     }
 }
