@@ -1,3 +1,4 @@
+use std::result;
 // Based on: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -233,8 +234,8 @@ impl<T: Send, E: Send> Promise<T, E> {
     // Promise.all
     pub fn all(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<Vec<T>, E>
     where
-        T: Send + 'static,
-        E: Send + 'static,
+        T: 'static,
+        E: 'static,
     {
         let fullfilled = Arc::new(Mutex::new(Vec::new()));
         Promise::new(move |resolve, reject| {
@@ -306,6 +307,73 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
     // Promise.allSettled
+    #[allow(non_snake_case)]
+    pub fn allSettled(
+        promises: impl IntoIterator<Item = Promise<T, E>> + 'static,
+    ) -> Promise<Vec<State<T, E>>, ()>
+    where
+        T: 'static,
+        E: 'static,
+    {
+        let results = Arc::new(Mutex::new(Vec::new()));
+        Promise::new(move |resolve, _reject| {
+            let resolve = Arc::new(Mutex::new(Some(resolve)));
+            let mut is_pending = false;
+
+            let promises: Vec<_> = promises.into_iter().collect();
+            let n_promises = promises.len();
+
+            for promise in promises {
+                let results = results.clone();
+                let results_inner = results.clone();
+                let resolve = resolve.clone();
+
+                let inner_logic = Arc::new(Mutex::new(Some(move |value: State<T, E>| {
+                    results.lock().unwrap().push(value);
+
+                    // Check if all promises are resolved
+                    if results.lock().unwrap().len() == n_promises {
+                        let resolve = resolve.lock().unwrap().take().unwrap();
+                        resolve(get_inner(results));
+                    }
+                })));
+                let inner_logic_clone = inner_logic.clone();
+
+                {
+                    let guard = promise.promise.clone();
+                    let mut inner = guard.lock().unwrap();
+                    if let State::Pending = inner.state {
+                        is_pending = true;
+                        // Overwrite callback
+                        inner.callback_fullfilled.replace(Box::new(move |value| {
+                            let inner_logic = inner_logic.lock().unwrap().take().unwrap();
+                            inner_logic(State::Fulfilled(value));
+                        }));
+                        inner.callback_rejected.replace(Box::new(move |error| {
+                            let inner_logic = inner_logic_clone.lock().unwrap().take().unwrap();
+                            inner_logic(State::Rejected(error));
+                        }));
+                        continue;
+                    }
+                }
+
+                match get_inner(promise.promise).state {
+                    State::Pending => unreachable!("Pending state is handled before"),
+                    State::Fulfilled(value) => {
+                        results_inner.lock().unwrap().push(State::Fulfilled(value))
+                    }
+                    State::Rejected(error) => {
+                        results_inner.lock().unwrap().push(State::Rejected(error))
+                    }
+                }
+            }
+            // No async promises, can resolve immediately
+            if is_pending == false {
+                let resolve = resolve.lock().unwrap().take().unwrap();
+                resolve(get_inner(results));
+            }
+        })
+    }
     // Promise.any
     // Promise.resolve
     // Promise.reject
@@ -611,5 +679,86 @@ mod tests {
         let promise = Promise::all(promises);
         thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(promise.state(), State::Rejected(2));
+    }
+
+    #[test]
+    pub fn allSettled() {
+        let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promise2: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promise3: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::allSettled(promises);
+        assert_eq!(
+            promise.state(),
+            State::Fulfilled(vec![
+                State::Fulfilled(42),
+                State::Fulfilled(42),
+                State::Fulfilled(42)
+            ])
+        );
+    }
+
+    #[test]
+    pub fn allSettled_reject() {
+        let promise1: Promise<i32, i32> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(0);
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            reject(1);
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::allSettled(promises);
+
+        // Order of promises is not guaranteed
+        let possible_results = vec![State::Fulfilled(42), State::Rejected(0), State::Rejected(1)];
+        for promise in &promise.state().unwrap() {
+            assert!(possible_results.contains(promise));
+        }
+    }
+
+    #[test]
+    pub fn allSettled_on_timeout() {
+        use std::thread;
+        let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            // resolve after 1 second
+            // create a new thread
+            resolve(1);
+        });
+        let promise2: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            // resolve after 1 second
+            // create a new thread
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(10));
+                resolve(2);
+            });
+        });
+        let promise3: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+            // resolve after 1 second
+            // create a new thread
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(100));
+                resolve(3);
+            });
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::allSettled(promises);
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            promise.state(),
+            State::Fulfilled(vec![
+                State::Fulfilled(1),
+                State::Fulfilled(2),
+                State::Fulfilled(3)
+            ])
+        );
     }
 }
