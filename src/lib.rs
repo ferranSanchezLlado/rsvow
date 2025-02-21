@@ -37,6 +37,19 @@ pub struct Promise<T, E> {
     promise: ArcMutex<PromiseInner<T, E>>,
 }
 
+fn get_inner<T>(promise: ArcMutex<T>) -> T {
+    Arc::try_unwrap(promise)
+        .unwrap_or_else(|el| {
+            panic!(
+                "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
+                Arc::strong_count(&el),
+                Arc::weak_count(&el)
+            )
+        })
+        .into_inner()
+        .unwrap()
+}
+
 impl<T: Send, E: Send> Promise<T, E> {
     pub fn new<'a>(
         executor: impl FnOnce(Box<dyn FnOnce(T) + Send + 'a>, Box<dyn FnOnce(E) + Send + 'a>) + 'a,
@@ -154,30 +167,18 @@ impl<T: Send, E: Send> Promise<T, E> {
                 reject(new_error);
             };
 
-            let guard = self.promise.clone();
-            let mut inner = guard.lock().unwrap();
-            if let State::Pending = inner.state {
-                // Overwrite callback
-                inner.callback_fullfilled.replace(Box::new(resolve));
-                inner.callback_rejected.replace(Box::new(on_rejected));
-                return;
+            {
+                let guard = self.promise.clone();
+                let mut inner = guard.lock().unwrap();
+                if let State::Pending = inner.state {
+                    // Overwrite callback
+                    inner.callback_fullfilled.replace(Box::new(resolve));
+                    inner.callback_rejected.replace(Box::new(on_rejected));
+                    return;
+                }
             }
-            // Drops required to ensure only one strong reference to the promise
-            drop(inner);
-            drop(guard);
 
-            let inner_state = Arc::try_unwrap(self.promise)
-                .unwrap_or_else(|el| {
-                    panic!(
-                        "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                        Arc::strong_count(&el),
-                        Arc::weak_count(&el)
-                    )
-                })
-                .into_inner()
-                .unwrap()
-                .state;
-            match inner_state {
+            match get_inner(self.promise).state {
                 State::Pending => unreachable!("Pending state is handled before"),
                 State::Fulfilled(value) => resolve(value),
                 State::Rejected(error) => on_rejected(error),
@@ -191,44 +192,31 @@ impl<T: Send, E: Send> Promise<T, E> {
         E: 'static,
     {
         Promise::new(move |resolve, reject| {
-            let guard = self.promise.clone();
-            let mut inner = guard.lock().unwrap();
-            if let State::Pending = inner.state {
-                // TODO: Find a way to avoid the Arc<Mutex<Option<FnOnce()>>> and the clone
-                let on_finally_fullfilled = Arc::new(Mutex::new(Some(on_finally)));
-                let on_finally_rejected = on_finally_fullfilled.clone();
+            {
+                let guard = self.promise.clone();
+                let mut inner = guard.lock().unwrap();
+                if let State::Pending = inner.state {
+                    let on_finally_fullfilled = Arc::new(Mutex::new(Some(on_finally)));
+                    let on_finally_rejected = on_finally_fullfilled.clone();
 
-                // Overwrite callback
-                inner.callback_fullfilled.replace(Box::new(move |value| {
-                    resolve(value);
+                    // Overwrite callback
+                    inner.callback_fullfilled.replace(Box::new(move |value| {
+                        resolve(value);
 
-                    let on_finally = on_finally_fullfilled.lock().unwrap().take().unwrap();
-                    on_finally();
-                }));
-                inner.callback_rejected.replace(Box::new(move |error| {
-                    reject(error);
+                        let on_finally = on_finally_fullfilled.lock().unwrap().take().unwrap();
+                        on_finally();
+                    }));
+                    inner.callback_rejected.replace(Box::new(move |error| {
+                        reject(error);
 
-                    let on_finally = on_finally_rejected.lock().unwrap().take().unwrap();
-                    on_finally();
-                }));
-                return;
+                        let on_finally = on_finally_rejected.lock().unwrap().take().unwrap();
+                        on_finally();
+                    }));
+                    return;
+                }
             }
-            // Drops required to ensure only one strong reference to the promise
-            drop(inner);
-            drop(guard);
 
-            let inner_state = Arc::try_unwrap(self.promise)
-                .unwrap_or_else(|el| {
-                    panic!(
-                        "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                        Arc::strong_count(&el),
-                        Arc::weak_count(&el)
-                    )
-                })
-                .into_inner()
-                .unwrap()
-                .state;
-            match inner_state {
+            match get_inner(self.promise).state {
                 State::Pending => unreachable!("Pending state is handled before"),
                 State::Fulfilled(value) => {
                     resolve(value);
@@ -267,62 +255,40 @@ impl<T: Send, E: Send> Promise<T, E> {
                 let is_rejected_fullfilled = is_rejected.clone();
                 let is_rejected_reject = is_rejected.clone();
 
-                let guard = promise.promise.clone();
-                let mut inner = guard.lock().unwrap();
-                if let State::Pending = inner.state {
-                    is_pending = true;
-                    // Overwrite callback
-                    inner.callback_fullfilled.replace(Box::new(move |value| {
-                        if is_rejected_fullfilled.load(std::sync::atomic::Ordering::Relaxed) {
-                            return;
-                        }
+                {
+                    let guard = promise.promise.clone();
+                    let mut inner = guard.lock().unwrap();
+                    if let State::Pending = inner.state {
+                        is_pending = true;
+                        // Overwrite callback
+                        inner.callback_fullfilled.replace(Box::new(move |value| {
+                            if is_rejected_fullfilled.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
 
-                        fullfilled.lock().unwrap().push(value);
+                            fullfilled.lock().unwrap().push(value);
 
-                        // Check if all promises are resolved
-                        if fullfilled.lock().unwrap().len() == n_promises {
-                            let resolve = resolve.lock().unwrap().take().unwrap();
+                            // Check if all promises are resolved
+                            if fullfilled.lock().unwrap().len() == n_promises {
+                                let resolve = resolve.lock().unwrap().take().unwrap();
 
-                            let inner_fullfilled = Arc::try_unwrap(fullfilled)
-                                .unwrap_or_else(|el| {
-                                    panic!(
-                                        "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                                        Arc::strong_count(&el),
-                                        Arc::weak_count(&el)
-                                    )
-                                })
-                                .into_inner()
-                                .unwrap();
-                            resolve(inner_fullfilled);
-                        }
-                    }));
-                    inner.callback_rejected.replace(Box::new(move |error| {
-                        if is_rejected_reject.load(std::sync::atomic::Ordering::Relaxed) {
-                            return;
-                        }
+                                resolve(get_inner(fullfilled));
+                            }
+                        }));
+                        inner.callback_rejected.replace(Box::new(move |error| {
+                            if is_rejected_reject.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
 
-                        let reject = reject.lock().unwrap().take().unwrap();
-                        is_rejected_reject.store(true, std::sync::atomic::Ordering::Relaxed);
-                        reject(error);
-                    }));
-                    continue;
+                            let reject = reject.lock().unwrap().take().unwrap();
+                            is_rejected_reject.store(true, std::sync::atomic::Ordering::Relaxed);
+                            reject(error);
+                        }));
+                        continue;
+                    }
                 }
-                // Drops required to ensure only one strong reference to the promise
-                drop(inner);
-                drop(guard);
 
-                let inner_state = Arc::try_unwrap(promise.promise)
-                    .unwrap_or_else(|el| {
-                        panic!(
-                            "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                            Arc::strong_count(&el),
-                            Arc::weak_count(&el)
-                        )
-                    })
-                    .into_inner()
-                    .unwrap()
-                    .state;
-                match inner_state {
+                match get_inner(promise.promise).state {
                     State::Pending => unreachable!("Pending state is handled before"),
                     State::Fulfilled(value) => fullfilled.lock().unwrap().push(value),
                     State::Rejected(error) => {
@@ -333,19 +299,9 @@ impl<T: Send, E: Send> Promise<T, E> {
                 }
             }
             // No async promises, can resolve immediately
-            if !is_pending {
+            if is_pending == false {
                 let resolve = resolve.lock().unwrap().take().unwrap();
-                let inner_fullfilled = Arc::try_unwrap(fullfilled)
-                    .unwrap_or_else(|el| {
-                        panic!(
-                            "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                            Arc::strong_count(&el),
-                            Arc::weak_count(&el)
-                        )
-                    })
-                    .into_inner()
-                    .unwrap();
-                resolve(inner_fullfilled);
+                resolve(get_inner(fullfilled));
             }
         })
     }
