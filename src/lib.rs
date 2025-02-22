@@ -1,9 +1,35 @@
 // Based on: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 type ArcMutex<T> = Arc<Mutex<T>>;
+const LOCK_ERROR: &str = "Failed to lock mutex";
+const DOUBLE_RESOLVE_ERROR: &str = "Promise can only be resolved once";
+const INNER_DOUBLE_RESOLVE_ERROR: &str = "Internal Error: Promise seems to be resolved twice";
+
+#[inline(always)]
+fn get_inner<T>(data: ArcMutex<T>) -> T {
+    Arc::try_unwrap(data)
+        .unwrap_or_else(|el| {
+            panic!(
+                "Failed to unwrap Arc to get inner (reference count: strong={}, weak={})",
+                Arc::strong_count(&el),
+                Arc::weak_count(&el)
+            )
+        })
+        .into_inner()
+        .expect(LOCK_ERROR)
+}
+
+#[inline(always)]
+fn get_inner_multi<T>(data: ArcMutex<Option<T>>) -> T {
+    data.lock()
+        .expect(LOCK_ERROR)
+        .take()
+        .expect(DOUBLE_RESOLVE_ERROR)
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State<T, E = ()> {
@@ -33,21 +59,9 @@ struct PromiseInner<T, E> {
     callback_fullfilled: Option<Box<dyn FnOnce(T) + Send>>,
     callback_rejected: Option<Box<dyn FnOnce(E) + Send>>,
 }
+
 pub struct Promise<T, E> {
     promise: ArcMutex<PromiseInner<T, E>>,
-}
-
-fn get_inner<T>(promise: ArcMutex<T>) -> T {
-    Arc::try_unwrap(promise)
-        .unwrap_or_else(|el| {
-            panic!(
-                "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                Arc::strong_count(&el),
-                Arc::weak_count(&el)
-            )
-        })
-        .into_inner()
-        .unwrap()
 }
 
 impl<T: Send, E: Send> Promise<T, E> {
@@ -71,30 +85,30 @@ impl<T: Send, E: Send> Promise<T, E> {
 
         executor(
             Box::new(move |value| {
-                if single_call_ensure_completion.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    panic!("Promise can only be resolved once");
+                if single_call_ensure_completion.swap(true, Relaxed) {
+                    panic!("{}", DOUBLE_RESOLVE_ERROR);
                 }
 
                 let PromiseInner {
                     state,
                     callback_fullfilled,
                     ..
-                } = &mut *promise_completion.lock().unwrap();
+                } = &mut *promise_completion.lock().expect(LOCK_ERROR);
                 match callback_fullfilled.take() {
                     Some(callback) => callback(value),
                     None => *state = State::Fulfilled(value),
                 }
             }),
             Box::new(move |error| {
-                if single_call_ensure_reject.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    panic!("Promise can only be resolved once");
+                if single_call_ensure_reject.swap(true, Relaxed) {
+                    panic!("{}", DOUBLE_RESOLVE_ERROR);
                 }
 
                 let PromiseInner {
                     state,
                     callback_rejected,
                     ..
-                } = &mut *promise_reject.lock().unwrap();
+                } = &mut *promise_reject.lock().expect(LOCK_ERROR);
                 match callback_rejected.take() {
                     Some(callback) => callback(error),
                     None => *state = State::Rejected(error),
@@ -121,7 +135,7 @@ impl<T: Send, E: Send> Promise<T, E> {
         T: Clone,
         E: Clone,
     {
-        self.promise.lock().unwrap().state.clone()
+        self.promise.lock().expect(LOCK_ERROR).state.clone()
     }
 
     pub fn then<U: Send>(self, on_fulfilled: impl FnOnce(T) -> U + Send + 'static) -> Promise<U, E>
@@ -130,36 +144,22 @@ impl<T: Send, E: Send> Promise<T, E> {
         U: 'static,
         E: 'static,
     {
-        Promise::new(move |resolve, reject| {
+        Promise::new(move |resolve: Box<dyn FnOnce(U) + Send>, reject| {
             let on_fulfilled = move |value| {
                 let new_value = on_fulfilled(value);
                 resolve(new_value);
             };
 
-            let guard = self.promise.clone();
-            let mut inner = guard.lock().unwrap();
-            if let State::Pending = inner.state {
-                // Overwrite callback
-                inner.callback_fullfilled.replace(Box::new(on_fulfilled));
-                inner.callback_rejected.replace(Box::new(reject));
-                return;
+            {
+                let guard = self.promise.clone();
+                let mut inner = guard.lock().expect(LOCK_ERROR);
+                if let State::Pending = inner.state {
+                    inner.callback_fullfilled.replace(Box::new(on_fulfilled));
+                    inner.callback_rejected.replace(Box::new(reject));
+                    return;
+                }
             }
-            // Drops required to ensure only one strong reference to the promise
-            drop(inner);
-            drop(guard);
-
-            let inner_state = Arc::try_unwrap(self.promise)
-                .unwrap_or_else(|el| {
-                    panic!(
-                        "Failed to unwrap Arc. Should not happen (strong={}, weak={})",
-                        Arc::strong_count(&el),
-                        Arc::weak_count(&el)
-                    )
-                })
-                .into_inner()
-                .unwrap()
-                .state;
-            match inner_state {
+            match get_inner(self.promise).state {
                 State::Pending => unreachable!("Pending state is handled before"),
                 State::Fulfilled(value) => on_fulfilled(value),
                 State::Rejected(error) => reject(error),
@@ -181,9 +181,8 @@ impl<T: Send, E: Send> Promise<T, E> {
 
             {
                 let guard = self.promise.clone();
-                let mut inner = guard.lock().unwrap();
+                let mut inner = guard.lock().expect(LOCK_ERROR);
                 if let State::Pending = inner.state {
-                    // Overwrite callback
                     inner.callback_fullfilled.replace(Box::new(resolve));
                     inner.callback_rejected.replace(Box::new(on_rejected));
                     return;
@@ -206,22 +205,21 @@ impl<T: Send, E: Send> Promise<T, E> {
         Promise::new(move |resolve, reject| {
             {
                 let guard = self.promise.clone();
-                let mut inner = guard.lock().unwrap();
+                let mut inner = guard.lock().expect(LOCK_ERROR);
                 if let State::Pending = inner.state {
                     let on_finally_fullfilled = Arc::new(Mutex::new(Some(on_finally)));
                     let on_finally_rejected = on_finally_fullfilled.clone();
 
-                    // Overwrite callback
                     inner.callback_fullfilled.replace(Box::new(move |value| {
                         resolve(value);
 
-                        let on_finally = on_finally_fullfilled.lock().unwrap().take().unwrap();
+                        let on_finally = get_inner_multi(on_finally_fullfilled);
                         on_finally();
                     }));
                     inner.callback_rejected.replace(Box::new(move |error| {
                         reject(error);
 
-                        let on_finally = on_finally_rejected.lock().unwrap().take().unwrap();
+                        let on_finally = get_inner_multi(on_finally_rejected);
                         on_finally();
                     }));
                     return;
@@ -230,15 +228,10 @@ impl<T: Send, E: Send> Promise<T, E> {
 
             match get_inner(self.promise).state {
                 State::Pending => unreachable!("Pending state is handled before"),
-                State::Fulfilled(value) => {
-                    resolve(value);
-                    on_finally();
-                }
-                State::Rejected(error) => {
-                    reject(error);
-                    on_finally();
-                }
+                State::Fulfilled(value) => resolve(value),
+                State::Rejected(error) => reject(error),
             }
+            on_finally();
         })
     }
 
@@ -247,12 +240,12 @@ impl<T: Send, E: Send> Promise<T, E> {
         T: 'static,
         E: 'static,
     {
+        // Last promise to resolve is responsible for resolving the all promise
         let fullfilled = Arc::new(Mutex::new(Vec::new()));
         Promise::new(move |resolve, reject| {
             let resolve = Arc::new(Mutex::new(Some(resolve)));
             let reject = Arc::new(Mutex::new(Some(reject)));
-            let is_rejected = Arc::new(AtomicBool::new(false));
-            let mut is_pending = false;
+            let is_resolved = Arc::new(AtomicBool::new(false));
 
             let promises: Vec<_> = promises.into_iter().collect();
             let n_promises = promises.len();
@@ -263,36 +256,33 @@ impl<T: Send, E: Send> Promise<T, E> {
                 let resolve = resolve.clone();
                 let reject = reject.clone();
 
-                let is_rejected_fullfilled = is_rejected.clone();
-                let is_rejected_reject = is_rejected.clone();
+                let is_resolved_fullfilled = is_resolved.clone();
+                let is_resolved_reject = is_resolved.clone();
 
                 {
                     let guard = promise.promise.clone();
-                    let mut inner = guard.lock().unwrap();
+                    let mut inner = guard.lock().expect(LOCK_ERROR);
                     if let State::Pending = inner.state {
-                        is_pending = true;
-                        // Overwrite callback
                         inner.callback_fullfilled.replace(Box::new(move |value| {
-                            if is_rejected_fullfilled.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_resolved_fullfilled.load(Relaxed) {
                                 return;
                             }
 
-                            fullfilled.lock().unwrap().push(value);
+                            let mut fullfilled_ref = fullfilled.lock().expect(LOCK_ERROR);
+                            fullfilled_ref.push(value);
 
-                            // Check if all promises are resolved
-                            if fullfilled.lock().unwrap().len() == n_promises {
-                                let resolve = resolve.lock().unwrap().take().unwrap();
-
+                            if fullfilled_ref.len() == n_promises {
+                                drop(fullfilled_ref);
+                                let resolve = get_inner_multi(resolve);
                                 resolve(get_inner(fullfilled));
                             }
                         }));
                         inner.callback_rejected.replace(Box::new(move |error| {
-                            if is_rejected_reject.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_resolved_reject.swap(true, Relaxed) {
                                 return;
                             }
 
-                            let reject = reject.lock().unwrap().take().unwrap();
-                            is_rejected_reject.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let reject = get_inner_multi(reject);
                             reject(error);
                         }));
                         continue;
@@ -301,17 +291,24 @@ impl<T: Send, E: Send> Promise<T, E> {
 
                 match get_inner(promise.promise).state {
                     State::Pending => unreachable!("Pending state is handled before"),
-                    State::Fulfilled(value) => fullfilled.lock().unwrap().push(value),
+                    State::Fulfilled(value) => {
+                        if is_resolved.load(Relaxed) {
+                            return;
+                        }
+                        fullfilled.lock().expect(LOCK_ERROR).push(value);
+                    }
                     State::Rejected(error) => {
-                        let reject = reject.lock().unwrap().take().unwrap();
+                        if is_resolved_reject.swap(true, Relaxed) {
+                            return;
+                        }
+                        let reject = get_inner_multi(reject);
                         reject(error);
                         return;
                     }
                 }
             }
-            // No async promises, can resolve immediately
-            if is_pending == false {
-                let resolve = resolve.lock().unwrap().take().unwrap();
+            if fullfilled.lock().expect(LOCK_ERROR).len() == n_promises {
+                let resolve = get_inner(resolve).expect(INNER_DOUBLE_RESOLVE_ERROR);
                 resolve(get_inner(fullfilled));
             }
         })
@@ -325,62 +322,75 @@ impl<T: Send, E: Send> Promise<T, E> {
         T: 'static,
         E: 'static,
     {
-        let results = Arc::new(Mutex::new(Vec::new()));
+        // Last promise to resolve is responsible for resolving the all promise
+        let results = Arc::new(Mutex::new(Some(Vec::new())));
         Promise::new(move |resolve, _reject| {
             let resolve = Arc::new(Mutex::new(Some(resolve)));
-            let mut is_pending = false;
 
             let promises: Vec<_> = promises.into_iter().collect();
             let n_promises = promises.len();
 
             for promise in promises {
-                let results = results.clone();
-                let results_inner = results.clone();
-                let resolve = resolve.clone();
+                let results_fullfilled = results.clone();
+                let results_rejected = results.clone();
 
-                let inner_logic = Arc::new(Mutex::new(Some(move |value: State<T, E>| {
-                    results.lock().unwrap().push(value);
-
-                    // Check if all promises are resolved
-                    if results.lock().unwrap().len() == n_promises {
-                        let resolve = resolve.lock().unwrap().take().unwrap();
-                        resolve(get_inner(results));
-                    }
-                })));
-                let inner_logic_clone = inner_logic.clone();
+                let resolve_fullfilled = resolve.clone();
+                let resolve_rejected = resolve.clone();
 
                 {
                     let guard = promise.promise.clone();
-                    let mut inner = guard.lock().unwrap();
+                    let mut inner = guard.lock().expect(LOCK_ERROR);
                     if let State::Pending = inner.state {
-                        is_pending = true;
-                        // Overwrite callback
                         inner.callback_fullfilled.replace(Box::new(move |value| {
-                            let inner_logic = inner_logic.lock().unwrap().take().unwrap();
-                            inner_logic(State::Fulfilled(value));
+                            let len;
+                            {
+                                let mut guard = results_fullfilled.lock().expect(LOCK_ERROR);
+                                let results_ref = guard.as_mut().expect(INNER_DOUBLE_RESOLVE_ERROR);
+                                results_ref.push(State::Fulfilled(value));
+                                len = results_ref.len();
+                            }
+
+                            if len == n_promises {
+                                let resolve = get_inner_multi(resolve_fullfilled);
+                                resolve(get_inner_multi(results_fullfilled));
+                            }
                         }));
                         inner.callback_rejected.replace(Box::new(move |error| {
-                            let inner_logic = inner_logic_clone.lock().unwrap().take().unwrap();
-                            inner_logic(State::Rejected(error));
+                            let len;
+                            {
+                                let mut guard = results_rejected.lock().expect(LOCK_ERROR);
+                                let results_ref = guard.as_mut().expect(INNER_DOUBLE_RESOLVE_ERROR);
+                                results_ref.push(State::Rejected(error));
+                                len = results_ref.len();
+                            }
+
+                            if len == n_promises {
+                                let resolve = get_inner_multi(resolve_rejected);
+                                resolve(get_inner_multi(results_rejected));
+                            }
                         }));
                         continue;
                     }
                 }
 
+                let mut guard = results.lock().expect(LOCK_ERROR);
+                let results = guard.as_mut().expect(INNER_DOUBLE_RESOLVE_ERROR);
                 match get_inner(promise.promise).state {
                     State::Pending => unreachable!("Pending state is handled before"),
-                    State::Fulfilled(value) => {
-                        results_inner.lock().unwrap().push(State::Fulfilled(value))
-                    }
-                    State::Rejected(error) => {
-                        results_inner.lock().unwrap().push(State::Rejected(error))
-                    }
+                    State::Fulfilled(value) => results.push(State::Fulfilled(value)),
+                    State::Rejected(error) => results.push(State::Rejected(error)),
                 }
             }
-            // No async promises, can resolve immediately
-            if is_pending == false {
-                let resolve = resolve.lock().unwrap().take().unwrap();
-                resolve(get_inner(results));
+            if results
+                .lock()
+                .expect(LOCK_ERROR)
+                .as_ref()
+                .expect(INNER_DOUBLE_RESOLVE_ERROR)
+                .len()
+                == n_promises
+            {
+                let resolve = get_inner(resolve).expect(INNER_DOUBLE_RESOLVE_ERROR);
+                resolve(get_inner(results).expect(INNER_DOUBLE_RESOLVE_ERROR));
             }
         })
     }
@@ -390,12 +400,12 @@ impl<T: Send, E: Send> Promise<T, E> {
         T: 'static,
         E: 'static,
     {
+        // Last promise to resolve is responsible for resolving the any promise
         let errors = Arc::new(Mutex::new(Vec::new()));
         Promise::new(move |resolve, reject| {
             let resolve = Arc::new(Mutex::new(Some(resolve)));
             let reject = Arc::new(Mutex::new(Some(reject)));
-            let is_fullfilled = Arc::new(AtomicBool::new(false));
-            let mut is_pending = false;
+            let is_resolved = Arc::new(AtomicBool::new(false));
 
             let promises: Vec<_> = promises.into_iter().collect();
             let n_promises = promises.len();
@@ -406,34 +416,32 @@ impl<T: Send, E: Send> Promise<T, E> {
                 let resolve = resolve.clone();
                 let reject = reject.clone();
 
-                let is_fullfilled_1 = is_fullfilled.clone();
-                let is_fulfilled_2 = is_fullfilled.clone();
+                let is_resolved_fullfilled = is_resolved.clone();
+                let is_resolved_rejected = is_resolved.clone();
 
                 {
                     let guard = promise.promise.clone();
-                    let mut inner = guard.lock().unwrap();
+                    let mut inner = guard.lock().expect(LOCK_ERROR);
                     if let State::Pending = inner.state {
-                        is_pending = true;
-                        // Overwrite callback
                         inner.callback_fullfilled.replace(Box::new(move |value| {
-                            if is_fullfilled_1.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_resolved_fullfilled.swap(true, Relaxed) {
                                 return;
                             }
 
-                            let resolve = resolve.lock().unwrap().take().unwrap();
-                            is_fullfilled_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let resolve = get_inner_multi(resolve);
                             resolve(value);
                         }));
                         inner.callback_rejected.replace(Box::new(move |error| {
-                            if is_fulfilled_2.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_resolved_rejected.load(Relaxed) {
                                 return;
                             }
 
-                            errors.lock().unwrap().push(error);
-                            // Check if all promises rejected
-                            if errors.lock().unwrap().len() == n_promises {
-                                let reject = reject.lock().unwrap().take().unwrap();
+                            let mut errors_ref = errors.lock().expect(LOCK_ERROR);
+                            errors_ref.push(error);
 
+                            if errors_ref.len() == n_promises {
+                                let reject = get_inner(reject).expect(INNER_DOUBLE_RESOLVE_ERROR);
+                                drop(errors_ref);
                                 reject(get_inner(errors));
                             }
                         }));
@@ -444,16 +452,25 @@ impl<T: Send, E: Send> Promise<T, E> {
                 match get_inner(promise.promise).state {
                     State::Pending => unreachable!("Pending state is handled before"),
                     State::Fulfilled(value) => {
-                        let resolve = resolve.lock().unwrap().take().unwrap();
-                        is_fullfilled_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if is_resolved.swap(true, Relaxed) {
+                            return;
+                        }
+                        let resolve = get_inner_multi(resolve);
                         resolve(value);
+                        return;
                     }
-                    State::Rejected(error) => errors.lock().unwrap().push(error),
+                    State::Rejected(error) => {
+                        if is_resolved.load(Relaxed) {
+                            return;
+                        }
+                        let mut errors_ref = errors.lock().expect(LOCK_ERROR);
+                        errors_ref.push(error);
+                    }
                 }
             }
             // No async promises, can resolve immediately
-            if is_pending == false {
-                let reject = reject.lock().unwrap().take().unwrap();
+            if errors.lock().expect(LOCK_ERROR).len() == n_promises {
+                let reject = get_inner(reject).expect(INNER_DOUBLE_RESOLVE_ERROR);
                 reject(get_inner(errors));
             }
         })
@@ -467,36 +484,33 @@ impl<T: Send, E: Send> Promise<T, E> {
         Promise::new(move |resolve, reject| {
             let resolve = Arc::new(Mutex::new(Some(resolve)));
             let reject = Arc::new(Mutex::new(Some(reject)));
-            let is_finished = Arc::new(AtomicBool::new(false));
+            let is_resolved = Arc::new(AtomicBool::new(false));
 
             for promise in promises {
                 let resolve = resolve.clone();
                 let reject = reject.clone();
 
-                let is_finished_1 = is_finished.clone();
-                let is_finished_2 = is_finished.clone();
+                let is_resolved_fullfilled = is_resolved.clone();
+                let is_finished_rejected = is_resolved_fullfilled.clone();
 
                 {
                     let guard = promise.promise.clone();
-                    let mut inner = guard.lock().unwrap();
+                    let mut inner = guard.lock().expect(LOCK_ERROR);
                     if let State::Pending = inner.state {
-                        // Overwrite callback
                         inner.callback_fullfilled.replace(Box::new(move |value| {
-                            if is_finished_1.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_resolved_fullfilled.swap(true, Relaxed) {
                                 return;
                             }
-                            is_finished_1.store(true, std::sync::atomic::Ordering::Relaxed);
 
-                            let resolve = resolve.lock().unwrap().take().unwrap();
+                            let resolve = get_inner_multi(resolve);
                             resolve(value);
                         }));
                         inner.callback_rejected.replace(Box::new(move |error| {
-                            if is_finished_2.load(std::sync::atomic::Ordering::Relaxed) {
+                            if is_finished_rejected.swap(true, Relaxed) {
                                 return;
                             }
-                            is_finished_2.store(true, std::sync::atomic::Ordering::Relaxed);
 
-                            let reject = reject.lock().unwrap().take().unwrap();
+                            let reject = get_inner_multi(reject);
                             reject(error);
                         }));
                         continue;
@@ -506,11 +520,17 @@ impl<T: Send, E: Send> Promise<T, E> {
                 match get_inner(promise.promise).state {
                     State::Pending => unreachable!("Pending state is handled before"),
                     State::Fulfilled(value) => {
-                        let resolve = resolve.lock().unwrap().take().unwrap();
+                        if is_resolved.swap(true, Relaxed) {
+                            return;
+                        }
+                        let resolve = get_inner_multi(resolve);
                         resolve(value);
                     }
                     State::Rejected(error) => {
-                        let reject = reject.lock().unwrap().take().unwrap();
+                        if is_resolved.swap(true, Relaxed) {
+                            return;
+                        }
+                        let reject = get_inner_multi(reject);
                         reject(error);
                     }
                 }
