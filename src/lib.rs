@@ -104,6 +104,18 @@ impl<T: Send, E: Send> Promise<T, E> {
         Self { promise }
     }
 
+    pub fn resolve(value: T) -> Self {
+        Self::new(|resolve, _reject| {
+            resolve(value);
+        })
+    }
+
+    pub fn reject(error: E) -> Self {
+        Self::new(|_resolve, reject| {
+            reject(error);
+        })
+    }
+
     pub fn state(&self) -> State<T, E>
     where
         T: Clone,
@@ -230,7 +242,6 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
-    // Promise.all
     pub fn all(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<Vec<T>, E>
     where
         T: 'static,
@@ -305,7 +316,7 @@ impl<T: Send, E: Send> Promise<T, E> {
             }
         })
     }
-    // Promise.allSettled
+
     #[allow(non_snake_case)]
     pub fn allSettled(
         promises: impl IntoIterator<Item = Promise<T, E>> + 'static,
@@ -373,7 +384,7 @@ impl<T: Send, E: Send> Promise<T, E> {
             }
         })
     }
-    // Promise.any
+
     pub fn any(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<T, Vec<E>>
     where
         T: 'static,
@@ -447,9 +458,66 @@ impl<T: Send, E: Send> Promise<T, E> {
             }
         })
     }
-    // Promise.resolve
-    // Promise.reject
-    // Promise.race
+
+    pub fn race(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<T, E>
+    where
+        T: 'static,
+        E: 'static,
+    {
+        Promise::new(move |resolve, reject| {
+            let resolve = Arc::new(Mutex::new(Some(resolve)));
+            let reject = Arc::new(Mutex::new(Some(reject)));
+            let is_finished = Arc::new(AtomicBool::new(false));
+
+            for promise in promises {
+                let resolve = resolve.clone();
+                let reject = reject.clone();
+
+                let is_finished_1 = is_finished.clone();
+                let is_finished_2 = is_finished.clone();
+
+                {
+                    let guard = promise.promise.clone();
+                    let mut inner = guard.lock().unwrap();
+                    if let State::Pending = inner.state {
+                        // Overwrite callback
+                        inner.callback_fullfilled.replace(Box::new(move |value| {
+                            if is_finished_1.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            is_finished_1.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                            let resolve = resolve.lock().unwrap().take().unwrap();
+                            resolve(value);
+                        }));
+                        inner.callback_rejected.replace(Box::new(move |error| {
+                            if is_finished_2.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            is_finished_2.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                            let reject = reject.lock().unwrap().take().unwrap();
+                            reject(error);
+                        }));
+                        continue;
+                    }
+                }
+
+                match get_inner(promise.promise).state {
+                    State::Pending => unreachable!("Pending state is handled before"),
+                    State::Fulfilled(value) => {
+                        let resolve = resolve.lock().unwrap().take().unwrap();
+                        resolve(value);
+                    }
+                    State::Rejected(error) => {
+                        let reject = reject.lock().unwrap().take().unwrap();
+                        reject(error);
+                    }
+                }
+                break;
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -484,8 +552,6 @@ mod tests {
     pub fn fulfilled_on_timeout() {
         use std::thread;
         let promise: Promise<bool, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(true);
@@ -527,8 +593,6 @@ mod tests {
     pub fn then_on_timeout() {
         use std::thread;
         let promise: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(42);
@@ -562,8 +626,6 @@ mod tests {
     pub fn catch_on_timeout() {
         use std::thread;
         let promise: Promise<(), &str> = Promise::new(|_resolve, reject| {
-            // reject after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 reject("error");
@@ -609,8 +671,6 @@ mod tests {
     pub fn finally_on_timeout() {
         use std::thread;
         let promise: Promise<i32, i32> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(42);
@@ -632,8 +692,6 @@ mod tests {
     pub fn finally_on_timeout_rejected() {
         use std::thread;
         let promise: Promise<i32, i32> = Promise::new(|_resolve, reject| {
-            // reject after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 reject(42);
@@ -697,21 +755,15 @@ mod tests {
     pub fn all_on_timeout() {
         use std::thread;
         let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             resolve(1);
         });
         let promise2: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(10));
                 resolve(2);
             });
         });
         let promise3: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
@@ -727,21 +779,15 @@ mod tests {
     pub fn all_on_timeout_rejected() {
         use std::thread;
         let promise1: Promise<i32, i32> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             resolve(1);
         });
         let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(10));
                 reject(2);
             });
         });
         let promise3: Promise<i32, i32> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
@@ -805,21 +851,15 @@ mod tests {
     pub fn allSettled_on_timeout() {
         use std::thread;
         let promise1: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             resolve(1);
         });
         let promise2: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(10));
                 resolve(2);
             });
         });
         let promise3: Promise<i32, ()> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(3);
@@ -873,16 +913,12 @@ mod tests {
         use std::thread;
         let promise1: Promise<i32, i32> = Promise::new(|_resolve, _reject| {});
         let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(10));
                 reject(0);
             });
         });
         let promise3: Promise<i32, i32> = Promise::new(|resolve, _reject| {
-            // resolve after 1 second
-            // create a new thread
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(20));
                 resolve(42);
@@ -892,5 +928,45 @@ mod tests {
         let promise = Promise::any(promises);
         thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(promise.state(), State::Fulfilled(42));
+    }
+
+    #[test]
+    pub fn race() {
+        use std::thread;
+        let promise1: Promise<i32, i32> = Promise::new(|_resolve, _reject| {});
+        let promise2: Promise<i32, i32> = Promise::new(|resolve, _reject| {
+            resolve(42);
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(10));
+                reject(0);
+            });
+        });
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::race(promises);
+        assert_eq!(promise.state(), State::Fulfilled(42));
+    }
+
+    #[test]
+    pub fn race_on_timeout() {
+        use std::thread;
+        let promise1: Promise<i32, i32> = Promise::new(|resolve, _reject| {
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(20));
+                resolve(1);
+            });
+        });
+        let promise2: Promise<i32, i32> = Promise::new(|_resolve, reject| {
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(10));
+                reject(0);
+            });
+        });
+        let promise3: Promise<i32, i32> = Promise::new(|_resolve, _reject| {});
+        let promises: Vec<Promise<_, _>> = vec![promise1, promise2, promise3];
+        let promise = Promise::race(promises);
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(promise.state(), State::Rejected(0));
     }
 }
