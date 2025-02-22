@@ -58,7 +58,7 @@ use std::thread;
 
 fn main() {
     // Create a promise that immediately rejects.
-    let promise: Promise<(), &str> = Promise::reject("error");
+    let promise: Promise<(), &str> = Promise::reject("failure");
 
     // Transform the error message.
     let error_handled = promise.catch(|error| {
@@ -70,10 +70,7 @@ fn main() {
 
     assert_eq!(error_handled.state(), State::Pending);
     thread::sleep(std::time::Duration::from_millis(200));
-    match error_handled.state() {
-        State::Rejected(message) => println!("{}", message),
-        _ => (),
-    }
+    assert_eq!(error_handled.state(), State::Fulfilled("Handled error: failure"));
 }
 ```
 

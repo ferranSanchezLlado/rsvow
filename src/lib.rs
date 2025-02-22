@@ -16,7 +16,9 @@
 //! For example:
 //!
 //! ```rust
-//! let promise = Promise::resolve(42).then(|value| value * 2);
+//! use rsvow::{Promise, State};
+//!
+//! let promise: Promise<i32, ()> = Promise::resolve(42).then(|value| value * 2);
 //! assert_eq!(promise.state(), State::Fulfilled(84));
 //! ```
 //!
