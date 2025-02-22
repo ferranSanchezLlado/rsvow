@@ -84,8 +84,11 @@ fn get_inner_multi<T>(data: ArcMutex<Option<T>>) -> T {
 /// ```
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State<T, E> {
+    /// The promise is still in progress and has not yet settled.
     Pending,
+    /// The promise has successfully completed with a value of type `T`.
     Fulfilled(T),
+    /// The promise has failed with an error of type `E`.
     Rejected(E),
 }
 
@@ -159,9 +162,9 @@ struct PromiseInner<T, E> {
 ///
 /// Once a promise is created, you can:
 ///
-/// - Chain further operations with [`then`], which runs when the promise is fulfilled.
-/// - Handle errors using [`catch`], which runs when the promise is rejected.
-/// - Execute side effects regardless of the outcome using [`finally`].
+/// - Chain further operations with [`Promise::then`], which runs when the promise is fulfilled.
+/// - Handle errors using [`Promise::catch`], which runs when the promise is rejected.
+/// - Execute side effects regardless of the outcome using [`Promise::finally`].
 ///
 /// # Combinators
 ///
