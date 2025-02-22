@@ -1,4 +1,28 @@
-// Based on: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise
+//! # Promise Crate
+//!
+//! This crate provides a Rust-like implementation of JavaScript's Promise mechanism,
+//! allowing asynchronous or delayed computations that can either be fulfilled with
+//! a value or rejected with an error. It includes methods for chaining callbacks,
+//! catching rejections, running final actions, and various combinators (like `all`
+//! or `race`) to coordinate multiple promises.
+//!
+//! The interface is based on JavaScript's Promise, but adapted to Rust's ownership model.
+//! For more information, see the [MDN Web Docs](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise).
+//!
+//! ## Usage
+//!
+//! To use this crate, create promises through [`Promise::new`], [`Promise::resolve`],
+//! or [`Promise::reject`], then chain them with [`then`], [`catch`], or [`finally`].
+//! For example:
+//!
+//! ```rust
+//! let promise = Promise::resolve(42).then(|value| value * 2);
+//! assert_eq!(promise.state(), State::Fulfilled(84));
+//! ```
+//!
+//! For more complex cases, combinators like [`Promise::all`] and [`Promise::race`]
+//! coordinate multiple tasks. See individual function docs for details.
+use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -31,14 +55,53 @@ fn get_inner_multi<T>(data: ArcMutex<Option<T>>) -> T {
         .expect(DOUBLE_RESOLVE_ERROR)
 }
 
+/// Represents the current state of a promise.
+///
+/// A promise can be in one of three states:
+///
+/// - **Pending**: The promise is still in progress and has not yet settled.
+/// - **Fulfilled(T)**: The promise has successfully completed with a value of type `T`.
+/// - **Rejected(E)**: The promise has failed with an error of type `E`.
+///
+/// # Examples
+///
+/// Creating a fulfilled state:
+///
+/// ```rust
+/// use rsvow::State;
+///
+/// let fulfilled: State<_, ()> = State::Fulfilled(42);
+/// ```
+///
+/// Creating a rejected state:
+///
+/// ```rust
+/// use rsvow::State;
+///
+/// let rejected: State<(), _> = State::Rejected("error");
+/// ```
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum State<T, E = ()> {
+pub enum State<T, E> {
     Pending,
     Fulfilled(T),
     Rejected(E),
 }
 
 impl<T, E> State<T, E> {
+    /// Returns the contained value if the state is Fulfilled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state is not Fulfilled.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let state: State<i32, ()> = State::Fulfilled(42);
+    /// assert_eq!(state.unwrap(), 42);
+    /// ```
     pub fn unwrap(self) -> T {
         match self {
             State::Fulfilled(value) => value,
@@ -46,6 +109,20 @@ impl<T, E> State<T, E> {
         }
     }
 
+    /// Returns the contained error if the state is Rejected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state is not Rejected.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let state: State<i32, &str> = State::Rejected("error");
+    /// assert_eq!(state.unwrap_err(), "error");
+    /// ```
     pub fn unwrap_err(self) -> E {
         match self {
             State::Rejected(error) => error,
@@ -60,17 +137,114 @@ struct PromiseInner<T, E> {
     callback_rejected: Option<Box<dyn FnOnce(E) + Send>>,
 }
 
+/// A `Promise` represents the eventual outcome of an asynchronous operation,
+/// similar to JavaScript's Promise. It may be in one of three states:
+///
+/// - `State::Pending`: the operation is still in progress.
+/// - `State::Fulfilled(T)`: the operation completed successfully with a value of type `T`.
+/// - `State::Rejected(E)`: the operation failed with an error of type `E`.
+///
+/// # Creating Promises
+///
+/// A new promise is created using [`Promise::new`], which accepts an executor
+/// function that receives `resolve` and `reject` callbacks to settle the promise.
+/// Additionally, helper functions are provided:
+///
+/// - [`Promise::resolve`] returns a promise that is immediately fulfilled.
+/// - [`Promise::reject`] returns a promise that is immediately rejected.
+///
+/// # Chaining and Error Handling
+///
+/// Once a promise is created, you can:
+///
+/// - Chain further operations with [`then`], which runs when the promise is fulfilled.
+/// - Handle errors using [`catch`], which runs when the promise is rejected.
+/// - Execute side effects regardless of the outcome using [`finally`].
+///
+/// # Combinators
+///
+/// For coordinating multiple promises, several methods are available:
+///
+/// - [`Promise::all`] waits until every promise fulfills (or rejects early if any reject),
+/// - [`Promise::allSettled`] waits for all promises to settle and returns their states,
+/// - [`Promise::any`] fulfills as soon as any promise fulfills (or rejects with all errors),
+/// - [`Promise::race`] settles as soon as any promise settles.
+///
+/// # Example
+///
+/// ```rust
+/// use rsvow::{Promise, State};
+///
+/// // Create a promise that resolves immediately with 42.
+/// let promise: Promise<i32, ()> = Promise::resolve(42);
+///
+/// // Chain a `then` callback to double the value.
+/// let doubled = promise.then(|value| value * 2);
+///
+/// // Check the result.
+/// assert_eq!(doubled.state(), State::Fulfilled(84));
+/// ```
+///
+/// This struct provides a flexible, chainable interface for asynchronous tasks,
+/// enabling the composition of complex asynchronous workflows in a declarative style.
 pub struct Promise<T, E> {
     promise: ArcMutex<PromiseInner<T, E>>,
 }
 
-impl<T: Send, E: Send> Promise<T, E> {
+impl<T: Debug, E: Debug> Debug for Promise<T, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Promise")
+            .field("state", &self.promise.lock().expect(LOCK_ERROR).state)
+            .finish()
+    }
+}
+
+impl<T: PartialEq, E: PartialEq> PartialEq for Promise<T, E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.promise.lock().expect(LOCK_ERROR).state
+            == other.promise.lock().expect(LOCK_ERROR).state
+    }
+}
+
+impl<T, E> Promise<T, E> {
+    /// Creates a new Promise using the provided executor function.
+    ///
+    /// The executor receives `resolve` and `reject` closures to settle the promise.
+    ///
+    /// This is equivalent to the JavaScript Promise constructor.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let promise: Promise<i32, ()> = Promise::new(|resolve, _reject| {
+    ///     resolve(42);
+    /// });
+    /// assert_eq!(promise.state(), State::Fulfilled(42));
+    /// ```
+    ///
+    /// Multithreaded example:
+    /// ```
+    /// use rsvow::{Promise, State};
+    /// use std::thread;
+    ///
+    /// let promise: Promise<u8, bool> = Promise::new(|_resolve, reject| {
+    ///    thread::spawn(move || {
+    ///       thread::sleep(std::time::Duration::from_millis(20));
+    ///       reject(true);
+    ///   });
+    /// });
+    /// assert_eq!(promise.state(), State::Pending);
+    /// thread::sleep(std::time::Duration::from_millis(200));
+    /// assert_eq!(promise.state(), State::Rejected(true));
+    /// ```
     pub fn new<'a>(
         executor: impl FnOnce(Box<dyn FnOnce(T) + Send + 'a>, Box<dyn FnOnce(E) + Send + 'a>) + 'a,
     ) -> Self
     where
-        T: 'a,
-        E: 'a,
+        T: Send + 'a,
+        E: Send + 'a,
     {
         let promise = Arc::new(Mutex::new(PromiseInner {
             state: State::Pending,
@@ -118,18 +292,58 @@ impl<T: Send, E: Send> Promise<T, E> {
         Self { promise }
     }
 
-    pub fn resolve(value: T) -> Self {
+    /// Immediately resolves a promise with the given value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let promise: Promise<i32, ()> = Promise::resolve(42);
+    /// assert_eq!(promise.state(), State::Fulfilled(42));
+    /// ```
+    pub fn resolve(value: T) -> Self
+    where
+        T: Send,
+        E: Send,
+    {
         Self::new(|resolve, _reject| {
             resolve(value);
         })
     }
 
-    pub fn reject(error: E) -> Self {
+    /// Immediately rejects a promise with the given error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    /// let promise: Promise<(), &str> = Promise::reject("error");
+    /// assert_eq!(promise.state(), State::Rejected("error"));
+    /// ```
+    pub fn reject(error: E) -> Self
+    where
+        T: Send,
+        E: Send,
+    {
         Self::new(|_resolve, reject| {
             reject(error);
         })
     }
 
+    /// Returns the current state of the promise.
+    ///
+    /// This intended to be used for testing and debugging purposes.
+    /// No equivalent exists in JavaScript.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let promise: Promise<i32, ()> = Promise::resolve(-1);
+    /// assert_eq!(promise.state(), State::Fulfilled(-1));
+    /// ```
     pub fn state(&self) -> State<T, E>
     where
         T: Clone,
@@ -138,11 +352,24 @@ impl<T: Send, E: Send> Promise<T, E> {
         self.promise.lock().expect(LOCK_ERROR).state.clone()
     }
 
+    /// Chains a callback executed when the promise is fulfilled.
+    ///
+    /// If the promise is fulfilled, `on_fulfilled` is called with the value.
+    /// Otherwise, the rejection is passed through.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let promise: Promise<u64, String> = Promise::resolve(10).then(|v| v * 2);
+    /// assert_eq!(promise.state(), State::Fulfilled(20));
+    /// ```
     pub fn then<U: Send>(self, on_fulfilled: impl FnOnce(T) -> U + Send + 'static) -> Promise<U, E>
     where
-        T: 'static,
-        U: 'static,
-        E: 'static,
+        T: Send + 'static,
+        U: Send + 'static,
+        E: Send + 'static,
     {
         Promise::new(move |resolve: Box<dyn FnOnce(U) + Send>, reject| {
             let on_fulfilled = move |value| {
@@ -167,11 +394,24 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Catches a rejection from the promise and transforms the error.
+    ///
+    /// If the promise is rejected, `on_rejected` is called with the error.
+    /// Fulfilled promises pass the value along.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let promise: Promise<(), String> = Promise::reject("error").catch(|e| format!("{}!", e));
+    /// assert_eq!(promise.state(), State::Rejected("error!".to_string()));
+    /// ```
     pub fn catch<F: Send>(self, on_rejected: impl FnOnce(E) -> F + Send + 'static) -> Promise<T, F>
     where
-        T: 'static,
-        F: 'static,
-        E: 'static,
+        T: Send + 'static,
+        F: Send + 'static,
+        E: Send + 'static,
     {
         Promise::new(move |resolve, reject| {
             let on_rejected = move |error| {
@@ -197,10 +437,29 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Executes a callback when the promise is settled (fulfilled or rejected).
+    ///
+    /// The callback is executed regardless of the outcome.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let flag = Arc::new(Mutex::new(false));
+    /// let flag_clone = flag.clone();
+    ///
+    /// let promise: Promise<u16, ()> = Promise::resolve(42).finally(move || {
+    ///     *flag_clone.lock().unwrap() = true;
+    /// });
+    /// assert_eq!(promise.state(), State::Fulfilled(42));
+    /// assert_eq!(*flag.lock().unwrap(), true);
+    /// ```
     pub fn finally(self, on_finally: impl FnOnce() + Send + 'static) -> Promise<T, E>
     where
-        T: 'static,
-        E: 'static,
+        T: Send + 'static,
+        E: Send + 'static,
     {
         Promise::new(move |resolve, reject| {
             {
@@ -235,10 +494,32 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Waits for all promises to fulfill or rejects once any promise is rejected.
+    ///
+    /// Returns a promise that fulfills with a vector of all values or rejects immediately.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let p1 = Promise::resolve(1);
+    /// let p2 = Promise::resolve(2);
+    /// let p3 = Promise::resolve(3);
+    ///
+    /// let all: Promise<Vec<u8>, ()> = Promise::all(vec![p1, p2, p3]);
+    /// match all.state() {
+    ///    State::Fulfilled(mut values) => {
+    ///       values.sort();
+    ///       assert_eq!(values, vec![1, 2, 3]);
+    ///   },
+    ///  _ => unreachable!(),
+    /// }
+    /// ```
     pub fn all(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<Vec<T>, E>
     where
-        T: 'static,
-        E: 'static,
+        T: Send + 'static,
+        E: Send + 'static,
     {
         // Last promise to resolve is responsible for resolving the all promise
         let fullfilled = Arc::new(Mutex::new(Vec::new()));
@@ -314,13 +595,32 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Waits for all promises to settle and returns a promise with an array of their states.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let p1: Promise<i8, &str> = Promise::resolve(1);
+    /// let p2: Promise<i8, &str> = Promise::reject("error");
+    ///
+    /// let all_settled = Promise::allSettled(vec![p1, p2]);
+    /// match all_settled.state() {
+    ///     State::Fulfilled(results) => {
+    ///         assert!(results.iter().any(|r| matches!(r, State::Fulfilled(1))));
+    ///         assert!(results.iter().any(|r| matches!(r, State::Rejected("error"))));
+    ///     },
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
     #[allow(non_snake_case)]
     pub fn allSettled(
         promises: impl IntoIterator<Item = Promise<T, E>> + 'static,
     ) -> Promise<Vec<State<T, E>>, ()>
     where
-        T: 'static,
-        E: 'static,
+        T: Send + 'static,
+        E: Send + 'static,
     {
         // Last promise to resolve is responsible for resolving the all promise
         let results = Arc::new(Mutex::new(Some(Vec::new())));
@@ -395,10 +695,24 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Resolves as soon as any promise is fulfilled, or rejects with a list of errors if all reject.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let p1 = Promise::reject(0);
+    /// let p2 = Promise::resolve(42);
+    /// let p3 = Promise::reject(1);
+    ///
+    /// let any: Promise<usize, Vec<i8>> = Promise::any(vec![p1, p2, p3]);
+    /// assert_eq!(any.state(), State::Fulfilled(42));
+    /// ```
     pub fn any(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<T, Vec<E>>
     where
-        T: 'static,
-        E: 'static,
+        T: Send + 'static,
+        E: Send + 'static,
     {
         // Last promise to resolve is responsible for resolving the any promise
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -476,10 +790,23 @@ impl<T: Send, E: Send> Promise<T, E> {
         })
     }
 
+    /// Settles as soon as any promise resolves or rejects, adopting that value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rsvow::{Promise, State};
+    ///
+    /// let p1: Promise<isize, ()> = Promise::new(|_resolve, _reject| {});
+    /// let p2 = Promise::resolve(42);
+    ///
+    /// let race = Promise::race(vec![p1, p2]);
+    /// assert_eq!(race.state(), State::Fulfilled(42));
+    /// ```
     pub fn race(promises: impl IntoIterator<Item = Promise<T, E>> + 'static) -> Promise<T, E>
     where
-        T: 'static,
-        E: 'static,
+        T: Send + 'static,
+        E: Send + 'static,
     {
         Promise::new(move |resolve, reject| {
             let resolve = Arc::new(Mutex::new(Some(resolve)));

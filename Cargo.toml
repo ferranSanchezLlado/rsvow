@@ -1,6 +1,16 @@
 [package]
-name = "promise"
+name = "rsvow"
 version = "0.1.0"
+authors = ["Ferran Sanchez Llado"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ferranSanchezLlado/rsvow"
+homepage = "https://github.com/ferranSanchezLlado/rsvow"
+documentation = "https://docs.rs/rsvow"
+description = "A Rust-like implementation of JavaScript's Promise mechanism"
+keywords = ["promise", "threads", "javascript", "js", "future"]
+categories = ["concurrency", "asynchronous", "development-tools"]
 edition = "2021"
+
 
 [dependencies]
